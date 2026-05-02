@@ -16,3 +16,23 @@
 
 /target
 Cargo.lock
+
+# Released ONNX model artifacts (~1.5 GB total). Downloaded on demand
+# via `gh release download models-siglip2-naflex-v1 --repo
+# Findit-AI/indexer --dir models/siglip2 ...` to run integration /
+# parity / EP-benchmark tests locally. The bundled
+# `models/tokenizer.json` is NOT covered by this rule (different path;
+# explicitly tracked and shipped via `include` in Cargo.toml).
+#
+# `calibration.json` is tracked (~300 bytes) — `build.rs` reads it
+# under the `bundled` feature to emit the `BUNDLED_LOGIT_SCALE` /
+# `BUNDLED_LOGIT_BIAS` constants. Use `models/siglip2/*` (glob the
+# contents) instead of `models/siglip2/` (ignore the directory) so
+# the negation below actually takes effect — git won't descend into
+# a wholly-ignored directory to evaluate negation rules.
+models/siglip2/*
+!models/siglip2/calibration.json
+.bench-models/
+
+docs/
+**.claude/
