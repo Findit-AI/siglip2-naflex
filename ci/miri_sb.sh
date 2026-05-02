@@ -35,4 +35,9 @@ cargo miri setup
 
 export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check"
 
-cargo miri test --all-targets --target "$TARGET"
+# Same scope and configuration as `miri_tb.sh`: SIMD-only test filter,
+# scalar dispatcher forced (miri can't evaluate intrinsics),
+# inference/decoders disabled (ort prebuilts missing on half the
+# matrix). See `miri_tb.sh` for the full rationale. Codex round-32.
+export RUSTFLAGS="${RUSTFLAGS:-} --cfg siglip2_force_scalar"
+cargo miri test --lib --target "$TARGET" --no-default-features --features serde simd::

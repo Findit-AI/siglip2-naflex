@@ -1,0 +1,190 @@
+name: coverage
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'COPYRIGHT'
+      - 'LICENSE'
+      - 'LICENSE-*'
+      - '**.md'
+      - '**.txt'
+      - 'docs/**'
+      - 'art'
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'COPYRIGHT'
+      - 'LICENSE'
+      - 'LICENSE-*'
+      - '**.md'
+      - '**.txt'
+      - 'docs/**'
+      - 'art'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Matrix dimensions cover the SIMD tier cascade so Codecov reflects
+# every dispatcher branch:
+#
+# - aarch64 NEON (macOS): covers `src/simd/arch/neon.rs` + the
+#   `neon_available()` branch of every dispatcher.
+# - aarch64 scalar-forced: covers the scalar-fallback branch of the
+#   dispatcher on aarch64 (only reachable when `siglip2_force_scalar`
+#   is set, since NEON is mandatory on aarch64 otherwise).
+# - x86_64 default (Linux): covers whichever top tier the runner CPU
+#   supports. AMD EPYC Milan on free GH runners has AVX2+FMA but not
+#   AVX-512, so this tier ends up exercising the AVX2 kernel.
+# - x86_64 AVX2-max: `--cfg siglip2_disable_avx512` forces the AVX2
+#   dispatcher branch regardless of runner CPU. (Equivalent to default
+#   on Milan but explicit, and keeps the path covered if a future
+#   runner family upgrades.)
+# - x86_64 SSE2-max: `--cfg siglip2_disable_avx512 --cfg
+#   siglip2_disable_avx2` forces the SSE2 dispatcher branch.
+# - x86_64 scalar-forced: `--cfg siglip2_force_scalar` forces the
+#   scalar dispatcher branch on x86_64.
+# - x86_64 Windows: validates the MSVC toolchain compiles the
+#   intrinsics-heavy modules.
+#
+# tarpaulin 0.27+ supports macOS and Windows via the LLVM
+# instrumentation engine (the default on non-Linux hosts). On Linux
+# it uses ptrace. Codecov merges uploads for the same commit, so the
+# final dashboard shows the union of every tier's reports.
+#
+# Each platform excludes SIMD files it *cannot* compile (gated behind
+# `#[cfg(target_arch)]`). Without exclusion, tarpaulin would count
+# them as 0/N uncovered lines, dragging down the per-platform number.
+# After Codecov merges, every arch file is covered by its native
+# hosts.
+
+jobs:
+  coverage:
+    name: coverage (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- aarch64 (macOS) ----
+          - os: macos-latest
+            label: macos-aarch64
+            rustflags: ''
+            features: '--all-features'
+            exclude_arch: "--exclude-files 'src/simd/arch/x86_*.rs' --exclude-files 'src/simd/arch/wasm_*.rs'"
+          - os: macos-latest
+            label: macos-aarch64-scalar
+            rustflags: '--cfg siglip2_force_scalar'
+            features: '--all-features'
+            exclude_arch: "--exclude-files 'src/simd/arch/x86_*.rs' --exclude-files 'src/simd/arch/wasm_*.rs'"
+
+          # ---- x86_64 (Linux) ----
+          - os: ubuntu-latest
+            label: linux-x86_64
+            rustflags: ''
+            features: '--all-features'
+            exclude_arch: "--exclude-files 'src/simd/arch/neon*.rs' --exclude-files 'src/simd/arch/wasm_*.rs'"
+          - os: ubuntu-latest
+            label: linux-x86_64-avx2-max
+            rustflags: '--cfg siglip2_disable_avx512'
+            features: '--all-features'
+            exclude_arch: "--exclude-files 'src/simd/arch/neon*.rs' --exclude-files 'src/simd/arch/wasm_*.rs'"
+          - os: ubuntu-latest
+            label: linux-x86_64-sse2-max
+            rustflags: '--cfg siglip2_disable_avx512 --cfg siglip2_disable_avx2'
+            features: '--all-features'
+            exclude_arch: "--exclude-files 'src/simd/arch/neon*.rs' --exclude-files 'src/simd/arch/wasm_*.rs'"
+          - os: ubuntu-latest
+            label: linux-x86_64-scalar
+            rustflags: '--cfg siglip2_force_scalar'
+            features: '--all-features'
+            exclude_arch: "--exclude-files 'src/simd/arch/neon*.rs' --exclude-files 'src/simd/arch/wasm_*.rs'"
+
+          # ---- x86_64 (Windows) ----
+          # Skips `inference`/`bundled`. ORT's prebuilt is /MD-linked,
+          # tokenizers' onig_sys/esaxx-rs C/C++ build scripts produce
+          # /MT objects — when both end up in one test executable,
+          # MSVC errors LNK2005 / LNK1169 (multiply-defined symbols).
+          # Windows still gets coverage for the pure-Rust subset
+          # (preprocessing, SIMD, embedding, decoders, calibration);
+          # the inference path is covered by the Linux/macOS tiers
+          # above, and codecov merges per-commit. Codex round-32.
+          - os: windows-latest
+            label: windows-x86_64
+            rustflags: ''
+            features: '--no-default-features --features decoders,serde'
+            exclude_arch: "--exclude-files 'src/simd/arch/neon*.rs' --exclude-files 'src/simd/arch/wasm_*.rs'"
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate coverage
+        shell: bash
+        # Per-tier `features` selects the feature set: `--all-features`
+        # everywhere except Windows (see matrix entry comment for
+        # rationale on the Windows MSVC CRT conflict). `--run-types
+        # tests` skips doc-tests (they're already covered by the test
+        # binary). `--exclude-files 'benches/*'` keeps bench files
+        # out of the coverage denominator. Per-tier `exclude_arch`
+        # excludes SIMD source files the platform cannot compile;
+        # see the workflow header comment.
+        run: |
+          mkdir -p coverage
+          cargo tarpaulin \
+            ${{ matrix.features }} \
+            --run-types tests \
+            --exclude-files 'benches/*' \
+            ${{ matrix.exclude_arch }} \
+            --out xml \
+            --output-dir coverage
+        continue-on-error: false
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.label }}
+          path: coverage/cobertura.xml
+
+  upload-codecov:
+    name: Upload merged coverage to Codecov
+    needs: coverage
+    runs-on: ubuntu-latest
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        label:
+          - macos-aarch64
+          - macos-aarch64-scalar
+          - linux-x86_64
+          - linux-x86_64-avx2-max
+          - linux-x86_64-sse2-max
+          - linux-x86_64-scalar
+          - windows-x86_64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download ${{ matrix.label }} report
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-${{ matrix.label }}
+          path: coverage/
+
+      - name: Upload ${{ matrix.label }} to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          files: coverage/cobertura.xml
+          flags: ${{ matrix.label }}
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

@@ -1,48 +1,199 @@
 [package]
-name = "template-rs"
-version = "0.0.0"
-edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
-license = "MIT OR Apache-2.0"
-rust-version = "1.73"
-
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
-
-[features]
-default = ["std"]
-alloc = []
-std = []
+name         = "siglip2-naflex"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+description  = "Rust ONNX inference library for SigLIP2 NaFlex (image+text embeddings)"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/Findit-AI/siglip2-naflex"
+keywords     = ["siglip2", "naflex", "embedding", "onnx", "ml"]
+categories   = ["multimedia::images", "science"]
 
 [dependencies]
+# `ort` and `tokenizers` are gated on the `inference` feature so the
+# crate compiles for wasm32 (where neither builds today — `ort` needs
+# native ONNX Runtime FFI and `tokenizers` pulls `onig_sys` /
+# `esaxx-rs` which lack wasm targets). Codex round-20 finding [high].
+# Without `inference` the crate exposes preprocessing, cosine
+# similarity, calibration parsing, and the SIMD primitives — useful
+# in environments where inference happens elsewhere (a server, a
+# different runtime, etc.).
+ort          = { version = "2.0.0-rc.12", optional = true }
+tokenizers   = { version = "0.23", optional = true }
+thiserror    = "2"
+smol_str     = "0.3"
+# Mandatory core dep: NaFlex preprocessing uses `image::imageops::resize`
+# (FilterType::Triangle) for the downscale step required by the
+# `max_num_patches = 256` cap. `default-features = false` — JPEG/PNG
+# decoders ship behind the `decoders` feature flag below, not by default.
+image        = { version = "0.25", default-features = false }
+# `serde` and `serde_json` are gated on the `serde` feature. Without
+# the feature, no value type carries `Serialize` / `Deserialize`,
+# `Calibration::from_path` / `from_bytes` are absent, and the four
+# `Siglip2::from_files` / `bundled` constructors that internally
+# call `Calibration::from_path` are also absent. Wasm consumers and
+# any caller that constructs `Siglip2` via `from_parts` get a
+# strictly leaner build. Mirrors the silero / egemma pattern.
+serde        = { version = "1", features = ["derive"], optional = true }
+serde_json   = { version = "1", optional = true }
 
+# `serde_json` is also a runtime dep behind `feature = "serde"`, but
+# the integration tests use it to load fixture JSON files (e.g.
+# `text_prompts.json`) regardless of which feature combo runs. Putting
+# it in dev-deps keeps it available to all `cargo test` invocations,
+# including `--no-default-features --features bundled` where the
+# runtime serde feature is off.
 [dev-dependencies]
+serde_json = "1"
+
+# Both dev-deps target native-only paths: `criterion` pulls in Rayon
+# (compile_error! on wasm32) and `npyz` is only used by integration
+# tests gated on `inference` (which itself is non-wasm). Target-gate
+# them so the wasmtime CI job's `cargo test --target wasm32-wasip1`
+# doesn't try to compile incompatible code.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = "0.8"
-tempfile = "3"
+npyz      = "0.9"
+
+# Build-time JSON parsing of `models/siglip2/calibration.json` for the
+# `bundled` feature, gated by `CARGO_FEATURE_BUNDLED` inside `build.rs`
+# (Cargo doesn't support feature-conditional `[build-dependencies]`).
+# The build cost is one-time per fresh build directory and capped by
+# `cargo:rerun-if-changed=models/siglip2/calibration.json` — only the
+# JSON file (or `build.rs` itself) triggers re-runs after that.
+[build-dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default   = ["inference", "bundled", "decoders"]
+# Activates the ONNX-backed inference path (`ImageEncoder`,
+# `TextEncoder`, `Siglip2`). Pulls `ort` + `tokenizers`, both of which
+# require native build scripts and so cannot target wasm32 today.
+# Disable on wasm via `--no-default-features` to compile the
+# preprocessing + similarity + SIMD subset.
+inference = ["dep:ort", "dep:tokenizers"]
+# Embeds the 32.8 MB text-tower tokenizer.json via include_bytes!.
+# The vision tower has no tokenizer; this feature is text-side only.
+# Implies `inference` because the bundled-tokenizer constructors live
+# on `TextEncoder` / `Siglip2`.
+bundled   = ["inference"]
+# Activates JPEG and PNG decoders inside the `image` crate. Gates
+# `ImageEncoder::embed_path` (§3.3). Without this, callers must supply
+# already-decoded RGB pixels via `ImageView`.
+decoders  = ["image/jpeg", "image/png"]
+# Pulls `serde` + `serde_json` and activates JSON-driven calibration
+# loading. With `serde` on you get:
+# - `Serialize` / `Deserialize` on `Options`, `BatchOptions`,
+#   `ThreadOptions`, `LabeledScore` (Serialize only), and
+#   `LabeledScoreOwned` (both),
+# - `Calibration::from_path` and `Calibration::from_bytes`,
+# - `Siglip2::from_files` / `from_files_with_options` / `bundled` /
+#   `bundled_with_options` (all of which load `calibration.json`).
+# Without `serde`, callers construct calibration directly via
+# `Calibration::new(scale, bias)` and assemble `Siglip2` via
+# `Siglip2::from_parts`. `Embedding` and `Calibration` deliberately
+# do NOT carry derives — round-trip via the inner slice / typed
+# constructor; see spec §3.5 and §5.3 for why.
+serde     = ["dep:serde", "dep:serde_json", "smol_str/serde"]
+
+# ----- Opt-in execution providers --------------------------------------
+#
+# Feature names mirror ort's own EP feature flags so a downstream
+# consumer can reason about both crates with the same vocabulary
+# (`siglip2/cuda` ↔ `ort/cuda`, etc.). Each feature activates the
+# corresponding ort sub-feature so the prebuilt ONNX Runtime that
+# gets linked includes that EP, and `session::build_session`
+# cfg-registers the EP at session-build time. None are enabled by
+# default — we measured CoreML on Apple Silicon as a 1.6× (vision)
+# / 2.7× (text) regression at batch=1 with the current released
+# fp32 NaFlex export, plus a 100 ms+ first-call cold penalty (see
+# `examples/bench_ep.rs` for the harness to reproduce). Other EPs
+# additionally require a native SDK at build time so requiring them
+# for every downstream consumer would break CPU-only builds.
+#
+# - cuda:     NVIDIA GPUs (Linux/Windows). Needs CUDA toolkit +
+#             cuDNN at both build and run time.
+# - tensorrt: NVIDIA, optimized inference (subsumes CUDA — register
+#             TensorRT first, fall back to CUDA, fall back to CPU).
+#             Needs CUDA + TensorRT installed.
+# - directml: Windows GPUs (any vendor) via DirectX 12. Ships with
+#             Windows 10 1903+. Note: layers on top of the existing
+#             ort/tokenizers MSVC CRT mismatch the Windows test job
+#             already excludes — best paired with default-feature
+#             builds outside the cargo-hack feature-powerset matrix.
+# - rocm:     AMD GPUs (Linux). Needs ROCm SDK installed.
+# - coreml:   macOS / iOS via Core ML (Neural Engine + GPU + Metal
+#             Performance Shaders). No build-time SDK — Apple's
+#             frameworks ship with the OS. Useful for callers with
+#             re-exported fp16 weights or batch>1 workloads where
+#             the per-op CoreML↔CPU transfer cost is amortized.
+cuda     = ["inference", "ort/cuda"]
+tensorrt = ["inference", "ort/tensorrt"]
+directml = ["inference", "ort/directml"]
+rocm     = ["inference", "ort/rocm"]
+coreml   = ["inference", "ort/coreml"]
+
+[[bench]]
+name    = "bench_naflex"
+harness = false
+[[bench]]
+name              = "bench_image_encode"
+harness           = false
+required-features = ["inference"]
+[[bench]]
+name              = "bench_text_encode"
+harness           = false
+required-features = ["inference"]
+[[bench]]
+name    = "bench_dot_768"
+harness = false
+
+# Integration tests reach into ImageEncoder / TextEncoder / Siglip2,
+# all gated on `inference`. Without this, `cargo hack test
+# --feature-powerset --no-default-features` would try to compile the
+# integration target without those types and fail. Codex round-22
+# finding [high].
+[[test]]
+name              = "integration"
+path              = "tests/integration.rs"
+required-features = ["inference"]
+
+[[example]]
+name              = "embed_keyframes"
+required-features = ["decoders", "inference"]
+[[example]]
+name              = "index_and_search"
+# `serde` is required because the example calls `Siglip2::from_files`,
+# which loads `calibration.json` via `serde_json` and is gated on
+# `feature = "serde"` since the JSON-driven calibration loading was
+# made opt-in.
+required-features = ["decoders", "inference", "serde"]
+[[example]]
+name              = "bench_ep"
+required-features = ["inference"]
+[[example]]
+name              = "bench_ep_text"
+required-features = ["inference"]
 
 [profile.bench]
-opt-level = 3
-debug = false
-codegen-units = 1
-lto = 'thin'
-incremental = false
-debug-assertions = false
-overflow-checks = false
-rpath = false
+opt-level         = 3
+debug             = false
+codegen-units     = 1
+lto               = 'thin'
+incremental       = false
+debug-assertions  = false
+overflow-checks   = false
+rpath             = false
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints.rust]
-rust_2018_idioms = "warn"
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+rust_2018_idioms     = "warn"
 single_use_lifetimes = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = [
-  'cfg(all_tests)',
-  'cfg(tarpaulin)',
-] }
+unexpected_cfgs      = { level = "warn", check-cfg = ['cfg(all_tests)', 'cfg(tarpaulin)', 'cfg(docsrs)', 'cfg(siglip2_force_scalar)', 'cfg(siglip2_disable_avx512)', 'cfg(siglip2_disable_avx2)'] }

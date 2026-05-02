@@ -1,10 +1,15 @@
 codecov:
   require_ci_to_pass: false
 
+# Quoted because YAML treats `*` as an alias-reference sigil. The
+# previous `- **benches/*` form crashed codecov's `safe_load` parser
+# with "while scanning an alias / expected alphabetic or numeric
+# character, but found '*'" and broke every upload job. The patterns
+# are codecov's own glob syntax (path-relative, `**` = any depth).
 ignore:
-  - **benches/*
-  - **examples/*
-  - **tests/*
+  - "**/benches/**"
+  - "**/examples/**"
+  - "**/tests/**"
 
 coverage:
   status:

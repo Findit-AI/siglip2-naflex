@@ -1,0 +1,6 @@
+{
+  "logit_scale": 4.747554302215576,
+  "logit_bias": -16.776988983154297,
+  "model_id": "google/siglip2-base-patch16-naflex",
+  "note": "Calibrated probability of a (image, text) match is sigmoid(logit_scale * cosine(image_emb, text_emb) + logit_bias). Both embeddings should be L2-normalized first."
+}

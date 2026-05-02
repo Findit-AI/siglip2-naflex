@@ -1,0 +1,209 @@
+name: parity
+
+# Two-stage gate. Each job runs only when its prerequisites are present;
+# unconfigured environments (forks, default CI) skip cleanly.
+#
+#   1. `model-load-smoke` — verifies the runtime can load the released
+#      model files (vision + text ONNX, calibration.json, tokenizer.json)
+#      and that the session-shape contract holds. Requires the
+#      FINDIT_INDEXER_TOKEN repo secret. **NOT a parity gate** — it
+#      proves load works, not that embeddings match upstream PyTorch.
+#
+#   2. `parity-against-pytorch` — actual cosine-floor parity against
+#      precomputed PyTorch reference embeddings. Requires the
+#      FINDIT_INDEXER_TOKEN secret. The golden-fixture set under
+#      `tests/fixtures/{images,embeddings}/`, `tests/fixtures/text_prompts.json`,
+#      and `tests/fixtures/text_embeddings.npy` is committed in-tree
+#      (regenerable via `scripts/generate_synthetic_keyframes.py` +
+#      `scripts/generate_parity_fixtures.py`). The fixtures-missing
+#      fail-closed branch below stays as a hard guard against accidental
+#      removal.
+#
+# Job-level `if:` does NOT reference `secrets.*` directly — that pattern
+# is unsupported by GitHub Actions for workflow-level conditional
+# evaluation. Instead, the `check-secret` job probes the secret through
+# an env variable and exposes a non-secret string output that downstream
+# jobs gate on. Codex round-12 finding [high].
+#
+# Codex round-5 / round-6 / round-11 / round-12 findings.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly safety net: catch upstream model-format drift even if no PR lands.
+    - cron: "0 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check-secret:
+    name: check parity-secret availability
+    runs-on: ubuntu-latest
+    outputs:
+      has_secret: ${{ steps.probe.outputs.has_secret }}
+    steps:
+      # Probe `FINDIT_INDEXER_TOKEN` via an env variable. The shell sees
+      # the secret value as `$INDEXER_TOKEN`, never as a raw template
+      # expansion in `if:`. The output is the string "true" or "false";
+      # downstream jobs gate on the string, not the secret.
+      - name: Probe FINDIT_INDEXER_TOKEN
+        id: probe
+        env:
+          INDEXER_TOKEN: ${{ secrets.FINDIT_INDEXER_TOKEN }}
+        run: |
+          if [ -n "${INDEXER_TOKEN:-}" ]; then
+            echo "has_secret=true" >> "$GITHUB_OUTPUT"
+            echo "FINDIT_INDEXER_TOKEN is configured; downstream parity jobs will run."
+          else
+            echo "has_secret=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::FINDIT_INDEXER_TOKEN not configured. Parity gate will be skipped (expected in forks; required in main branch protection)."
+          fi
+
+  model-load-smoke:
+    name: model-load smoke (load + session-shape only)
+    runs-on: ubuntu-latest
+    needs: check-secret
+    if: needs.check-secret.outputs.has_secret == 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      - name: Install gh CLI
+        run: |
+          type -p curl >/dev/null
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo apt update && sudo apt install gh -y
+
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.FINDIT_INDEXER_TOKEN }}
+        run: |
+          mkdir -p models/siglip2
+          gh release download models-siglip2-naflex-v1 \
+            --repo Findit-AI/indexer \
+            --dir models/siglip2 \
+            --pattern '*.onnx*' \
+            --pattern 'calibration.json' \
+            --pattern 'tokenizer.json'
+          (cd models/siglip2 && shasum -a 256 -c ../../tests/fixtures/MODELS.sha256)
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-parity-${{ hashFiles('**/Cargo.lock') }}
+
+      # Run ONLY the load tests. Excludes the parity / cross_modal_ranking
+      # tests so a missing-fixture state doesn't make this job red. Test
+      # name filter targets exactly the three load tests.
+      - name: cargo test (model-load only)
+        env:
+          SIGLIP2_MODELS_DIR: ${{ github.workspace }}/models/siglip2
+        run: |
+          cargo test --all-features --test integration -- --ignored \
+            loads_image_encoder_from_release \
+            loads_text_encoder_from_release \
+            loads_calibration_from_release
+
+  parity-against-pytorch:
+    name: parity (cosine-floor against PyTorch reference)
+    runs-on: ubuntu-latest
+    needs: [check-secret, model-load-smoke]
+    if: needs.check-secret.outputs.has_secret == 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check fixtures present
+        id: check_fixtures
+        run: |
+          missing=0
+          if ! [ -d tests/fixtures/images ] || ! ls tests/fixtures/images/*.png >/dev/null 2>&1; then
+            echo "::warning::tests/fixtures/images/ is empty or missing"
+            missing=1
+          fi
+          if ! [ -d tests/fixtures/embeddings ] || ! ls tests/fixtures/embeddings/*.npy >/dev/null 2>&1; then
+            echo "::warning::tests/fixtures/embeddings/ is empty or missing"
+            missing=1
+          fi
+          if [ ! -f tests/fixtures/text_prompts.json ]; then
+            echo "::warning::tests/fixtures/text_prompts.json missing"
+            missing=1
+          fi
+          if [ ! -f tests/fixtures/text_embeddings.npy ]; then
+            echo "::warning::tests/fixtures/text_embeddings.npy missing"
+            missing=1
+          fi
+          echo "missing=$missing" >> "$GITHUB_OUTPUT"
+
+      # If fixtures are missing, fail closed with a clear message so a
+      # configured-but-fixtureless CI doesn't look green when no parity
+      # has actually been verified.
+      - name: Block release on missing fixtures
+        if: steps.check_fixtures.outputs.missing == '1'
+        run: |
+          echo "::error::Parity fixtures missing. Generate them via the upstream PyTorch reference (see tests/fixtures/README.md) and commit, OR fetch them in a workflow step before this job. Until then, parity is NOT verified."
+          exit 1
+
+      - name: Install Rust
+        if: steps.check_fixtures.outputs.missing == '0'
+        run: rustup update stable && rustup default stable
+
+      - name: Install gh CLI
+        if: steps.check_fixtures.outputs.missing == '0'
+        run: |
+          type -p curl >/dev/null
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo apt update && sudo apt install gh -y
+
+      - name: Download release artifacts
+        if: steps.check_fixtures.outputs.missing == '0'
+        env:
+          GH_TOKEN: ${{ secrets.FINDIT_INDEXER_TOKEN }}
+        run: |
+          mkdir -p models/siglip2
+          gh release download models-siglip2-naflex-v1 \
+            --repo Findit-AI/indexer \
+            --dir models/siglip2 \
+            --pattern '*.onnx*' \
+            --pattern 'calibration.json' \
+            --pattern 'tokenizer.json'
+          (cd models/siglip2 && shasum -a 256 -c ../../tests/fixtures/MODELS.sha256)
+
+      - name: Cache cargo build
+        if: steps.check_fixtures.outputs.missing == '0'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-parity-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo test (parity)
+        if: steps.check_fixtures.outputs.missing == '0'
+        env:
+          SIGLIP2_MODELS_DIR: ${{ github.workspace }}/models/siglip2
+        run: |
+          cargo test --all-features --test integration -- --ignored \
+            image_parity_against_pytorch_reference \
+            text_parity_against_pytorch_reference \
+            cross_modal_ranking_sanity \
+            batched_embedding_matches_single_image \
+            embed_batch_empty_text_surfaces_index \
+            embed_single_empty_text_returns_empty_text \
+            embed_preprocessed_enforces_encoder_max_batch_size \
+            text_encoder_rejects_zero_batch_size \
+            text_encoder_rejects_batch_size_above_max
